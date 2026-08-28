@@ -351,65 +351,6 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
         await time_input.fill(str(publish_date_hour))
         await human_sleep(0.6, 1.6)
 
-    async def set_location(self, page: Page, location: str = "青岛市"):
-        if not location:
-            return True
-
-        xiaohongshu_logger.info(_msg("📍", f"小人准备设置位置: {location}"))
-        loc_ele = await page.wait_for_selector('div.d-text.d-select-placeholder.d-text-ellipsis.d-text-nowrap')
-        await loc_ele.click()
-        await page.wait_for_timeout(1000)
-        await page.keyboard.type(location)
-        dropdown_selector = 'div.d-popover.d-popover-default.d-dropdown.--size-min-width-large'
-        await page.wait_for_timeout(2000)
-        try:
-            await page.wait_for_selector(dropdown_selector, timeout=3000)
-        except Exception:
-            xiaohongshu_logger.warning(_msg("😵", "位置下拉列表没按预期出现，小人继续按旧逻辑查找"))
-        await page.wait_for_timeout(1000)
-        flexible_xpath = (
-            f'//div[contains(@class, "d-popover") and contains(@class, "d-dropdown")]'
-            f'//div[contains(@class, "d-options-wrapper")]'
-            f'//div[contains(@class, "d-grid") and contains(@class, "d-options")]'
-            f'//div[contains(@class, "name") and text()="{location}"]'
-        )
-        await page.wait_for_timeout(3000)
-        try:
-            location_option = await page.wait_for_selector(
-                flexible_xpath,
-                timeout=3000
-            )
-
-            if not location_option:
-                location_option = await page.wait_for_selector(
-                    f'//div[contains(@class, "d-popover") and contains(@class, "d-dropdown")]'
-                    f'//div[contains(@class, "d-options-wrapper")]'
-                    f'//div[contains(@class, "d-grid") and contains(@class, "d-options")]'
-                    f'/div[1]//div[contains(@class, "name") and text()="{location}"]',
-                    timeout=2000
-                )
-
-            await location_option.scroll_into_view_if_needed()
-            await location_option.click()
-            xiaohongshu_logger.success(_msg("🥳", f"位置已经设置成 {location}"))
-            return True
-        except Exception as e:
-            xiaohongshu_logger.error(_msg("😢", f"设置位置失败: {e}"))
-            try:
-                all_options = await page.query_selector_all(
-                    '//div[contains(@class, "d-popover") and contains(@class, "d-dropdown")]'
-                    '//div[contains(@class, "d-options-wrapper")]'
-                    '//div[contains(@class, "d-grid") and contains(@class, "d-options")]'
-                    '/div'
-                )
-                xiaohongshu_logger.debug(_msg("🧍", f"位置下拉里一共找到 {len(all_options)} 个选项"))
-                for i, option in enumerate(all_options[:3]):
-                    option_text = await option.inner_text()
-                    xiaohongshu_logger.debug(_msg("🧾", f"候选位置 {i + 1}: {option_text.strip()[:50]}"))
-            except Exception as inner_e:
-                xiaohongshu_logger.debug(_msg("😵", f"读取位置候选列表失败: {inner_e}"))
-            return False
-
     async def fill_title(self, page: Page) -> None:
         title_container = page.locator('input[placeholder*="填写标题"]')
         await title_container.fill(self.title[:20])
@@ -484,44 +425,64 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
             xiaohongshu_logger.warning(_msg("😵", f"展开「添加组件」失败: {e}"))
 
     async def set_location(self, page: Page, location: str = "") -> bool:
-        """设置发布位置（「添加组件 → 添加地点」）。有值才设置，失败跳过不中断。"""
+        """设置发布位置。地址组件（「添加地点」）在发布页始终可见，直接点击输入即可。
+
+        小红书「添加地点」是 d-select（DeerUI）受控组件，实测交互链
+        （用户 bsk 录制 trace + CDP 回放探针验证）：
+          1. CDP 真实点击 div.address-card-select（地址组件，始终可见，无需展开任何面板）
+          2. 输入框 div.d-select-input-filter.show input 出现后 fill 关键词
+          3. 候选列表是联想接口异步返回，要等一会才渲染在 div.d-dropdown
+             的 div.option-name（注意：不是 .d-option-name，实测 class 无 d- 前缀）
+          4. 有匹配候选 → 点击；等超时仍无候选 = 地图无此位置 → 跳过（不算失败）
+        """
         if not location:
             return False
         xiaohongshu_logger.info(_msg("📍", f"小人准备设置位置: {location}"))
         try:
-            # 1) 确保「添加组件」面板展开（添加地点位于折叠菜单内）
-            await self._open_add_component(page)
-            # 2) 点击「添加地点」：多路容错，直到输入框出现
+            # 1) 地址组件始终可见，直接点击（等它渲染出来，兜底视频上传竞态）
+            address_sel = page.locator('div.address-card-select').first
+            try:
+                await address_sel.wait_for(state="visible", timeout=20000)
+            except Exception:
+                xiaohongshu_logger.warning(_msg("😵", "地址组件未出现（视频可能仍在处理），跳过"))
+                return False
+            await address_sel.scroll_into_view_if_needed(timeout=5000)
+            if not await cdp_click(page, address_sel):
+                await address_sel.click(force=True)
+
+            # 2) 等输入框进入 show 态（d-select focus）
+            input_sel = 'div.address-card-select div.d-select-input-filter.show input'
             box = None
-            for _attempt in range(3):
-                loc = page.locator('div.wrapper', has_text="添加地点").first
-                if not await loc.count():
-                    loc = page.get_by_text("添加地点", exact=True).first
-                await loc.scroll_into_view_if_needed(timeout=4000)
-                # CDP 真实点击（force/JS click 可能不触发 React）
-                if not await cdp_click(page, loc):
-                    await loc.click(force=True)
-                for _i in range(8):
-                    # 点击「添加地点」后，其选择器输入框进入 show 态（d-select focus）
-                    b = page.locator('div.d-select-input-filter.show input').first
-                    if await b.count():
-                        box = b
-                        break
-                    await page.wait_for_timeout(800)
-                if box is not None:
+            for _i in range(10):
+                b = page.locator(input_sel).first
+                if await b.count() and await b.is_visible():
+                    box = b
                     break
+                await page.wait_for_timeout(800)
             if box is None:
-                raise RuntimeError("地点输入框未出现")
-            # 3) 输入地点关键词并触发搜索（真实 fill 触发 React 搜索，见录制 trace）
+                xiaohongshu_logger.warning(_msg("😵", "地点输入框未出现，跳过"))
+                return False
+
+            # 3) 输入关键词，候选是联想接口异步返回，轮询等待（最多 ~8s）
             await box.click(force=True)
             await box.fill(location)
-            await page.wait_for_timeout(3500)
-            opt = page.locator(
-                'div[class*="d-dropdown"] div[class*="name"]',
-                has_text=location,
-            ).last
-            if not await opt.count():
-                opt = page.get_by_text(location, exact=False).last
+
+            opt = None
+            for _i in range(8):
+                await page.wait_for_timeout(1000)
+                cand = page.locator(
+                    'div.d-dropdown div.option-name', has_text=location
+                ).first
+                if await cand.count() and await cand.is_visible():
+                    opt = cand
+                    break
+            if opt is None:
+                xiaohongshu_logger.warning(
+                    _msg("😵", f"未找到地点候选『{location}』（地图可能无此位置），跳过")
+                )
+                return False
+
+            # 4) 点击候选（点 option-name 触发选择）
             await opt.scroll_into_view_if_needed(timeout=4000)
             await opt.click(force=True)
             xiaohongshu_logger.success(_msg("🥳", f"位置已设置: {location}"))
