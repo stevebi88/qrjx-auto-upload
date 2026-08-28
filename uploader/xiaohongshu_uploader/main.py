@@ -13,6 +13,7 @@ from patchright.async_api import async_playwright
 
 from conf import DEBUG_MODE, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
 from uploader.base_video import BaseVideoUploader
+from utils.base_social_media import cdp_click
 from utils.base_social_media import set_init_script
 from utils.human_behavior import human_sleep
 from utils.login_qrcode import build_login_qrcode_path
@@ -493,22 +494,15 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
             # 2) 点击「添加地点」：多路容错，直到输入框出现
             box = None
             for _attempt in range(3):
-                try:
-                    loc = page.locator('div.wrapper', has_text="添加地点").first
-                    if not await loc.count():
-                        loc = page.get_by_text("添加地点", exact=True).first
-                    await loc.scroll_into_view_if_needed(timeout=4000)
+                loc = page.locator('div.wrapper', has_text="添加地点").first
+                if not await loc.count():
+                    loc = page.get_by_text("添加地点", exact=True).first
+                await loc.scroll_into_view_if_needed(timeout=4000)
+                # CDP 真实点击（force/JS click 可能不触发 React）
+                if not await cdp_click(page, loc):
                     await loc.click(force=True)
-                except Exception:
-                    await page.evaluate(
-                        """() => {
-                            const el = [...document.querySelectorAll('*')].find(
-                                e => (e.innerText || '').trim() === '添加地点' && e.children.length <= 2
-                            );
-                            if (el) el.click();
-                        }"""
-                    )
                 for _i in range(8):
+                    # 点击「添加地点」后，其选择器输入框进入 show 态（d-select focus）
                     b = page.locator('div.d-select-input-filter.show input').first
                     if await b.count():
                         box = b
@@ -518,18 +512,12 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
                     break
             if box is None:
                 raise RuntimeError("地点输入框未出现")
-            # 3) 输入地点关键词（JS 赋值 + input 事件，规避遮挡导致无法点击）
-            await box.evaluate(
-                """(el, val) => {
-                    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
-                    setter.call(el, val);
-                    el.dispatchEvent(new Event('input', { bubbles: true }));
-                }""",
-                location,
-            )
+            # 3) 输入地点关键词并触发搜索（真实 fill 触发 React 搜索，见录制 trace）
+            await box.click(force=True)
+            await box.fill(location)
             await page.wait_for_timeout(3500)
             opt = page.locator(
-                'div[class*="d-popover"] div[class*="d-options"] div[class*="name"]',
+                'div[class*="d-dropdown"] div[class*="name"]',
                 has_text=location,
             ).last
             if not await opt.count():
@@ -550,20 +538,36 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
             return False
         xiaohongshu_logger.info(_msg("📁", f"小人准备加入合集: {album}"))
         try:
-            add_album = page.get_by_text("加入合集", exact=True).first
-            await add_album.scroll_into_view_if_needed(timeout=5000)
-            await add_album.click(force=True)
+            # 1) 点击「加入合集」（CDP 真实点击，force 点击可能坐标偏差不触发）
+            title_el = page.locator('div.collection-plugin-content-title').first
+            await title_el.scroll_into_view_if_needed(timeout=5000)
+            if not await cdp_click(page, title_el):
+                await title_el.click(force=True)
             await page.wait_for_timeout(2000)
-            exist = page.get_by_text(album, exact=False).last
+            # 2) 弹层内点已有合集（collection-plugin-popover 内容区匹配）
+            exist = page.locator(
+                'div.collection-plugin-popover-content div', has_text=album
+            ).last
             if await exist.count():
                 await exist.click(force=True)
-            else:
-                name_input = page.locator('input[placeholder*="合集名称"]').first
-                await name_input.click()
-                await name_input.fill(album)
-                create_btn = page.get_by_text("创建并加入", exact=True).first
-                await create_btn.click(force=True)
-            xiaohongshu_logger.success(_msg("🥳", f"已加入合集: {album}"))
+                xiaohongshu_logger.success(_msg("🥳", f"已加入合集: {album}"))
+                return True
+            # 3) 无该合集 → 点 footer「创建合集」
+            create_btn = page.locator('div.popover-footer', has_text="创建合集").first
+            if not await create_btn.count():
+                create_btn = page.get_by_text("创建合集", exact=True).last
+            await create_btn.click(force=True)
+            await page.wait_for_timeout(1500)
+            # 4) 创建 modal：填合集名称 → 创建并加入
+            name_input = page.locator('input[placeholder*="合集名称"]').first
+            await name_input.click()
+            await name_input.fill(album)
+            create_join = page.get_by_role("button", name="创建并加入").first
+            await create_join.click(force=True)
+            await page.wait_for_timeout(1500)
+            # 创建合集后弹出「声明原创」引导弹窗
+            await self.handle_original_declaration_modal(page)
+            xiaohongshu_logger.success(_msg("🥳", f"已创建并加入合集: {album}"))
             return True
         except Exception as e:
             xiaohongshu_logger.warning(_msg("😵", f"设置合集失败，跳过: {e}"))
@@ -644,6 +648,38 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
                 await page.keyboard.press("Escape")
             except Exception:
                 pass
+
+    async def handle_original_declaration_modal(self, page: Page) -> None:
+        """处理「声明原创」弹窗（创建合集后 / 发布前可能出现）。
+
+        录制 trace 实测流程：
+          弹窗标题「笔记完成原创声明后，将获得以下权益」
+          → 勾选 checkbox「我已阅读并同意《原创声明须知》」
+          → 点 button「声明原创」。
+        容错：弹窗未出现直接返回；任一步失败记 warning 跳过，不中断发布。
+        """
+        try:
+            declare_btn = page.get_by_role("button", name="声明原创").first
+            if not await declare_btn.count():
+                return  # 无弹窗
+            xiaohongshu_logger.info(_msg("🧾", "发现「声明原创」弹窗，自动勾选同意并确认"))
+            await declare_btn.scroll_into_view_if_needed(timeout=4000)
+            # 勾选「我已阅读并同意《原创声明须知》」（modal 内最后一个 checkbox）
+            checkbox = page.locator(
+                '.d-modal input[type="checkbox"], [class*="modal"] input[type="checkbox"]'
+            ).last
+            if await checkbox.count():
+                try:
+                    if not await checkbox.is_checked():
+                        await checkbox.check(force=True)
+                except Exception:
+                    await checkbox.click(force=True)
+                await page.wait_for_timeout(500)
+            await declare_btn.click(force=True)
+            await page.wait_for_timeout(1000)
+            xiaohongshu_logger.success(_msg("🧾", "原创声明已完成"))
+        except Exception as e:
+            xiaohongshu_logger.warning(_msg("⚠️", f"处理「声明原创」弹窗失败，跳过: {e}"))
 
 
 class XiaoHongShuVideo(XiaoHongShuBaseUploader):
@@ -808,6 +844,9 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
 
         await self.check_original_declaration(page)
 
+        # 发布前兜底处理「声明原创」弹窗（创建合集等场景会触发）
+        await self.handle_original_declaration_modal(page)
+
         if self.location:
             await self.set_location(page, self.location)
         if self.album:
@@ -944,6 +983,9 @@ class XiaoHongShuNote(XiaoHongShuBaseUploader):
         await self.fill_meta(page)
 
         await self.check_original_declaration(page)
+
+        # 发布前兜底处理「声明原创」弹窗（创建合集等场景会触发）
+        await self.handle_original_declaration_modal(page)
 
         if self.location:
             await self.set_location(page, self.location)
