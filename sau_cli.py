@@ -158,6 +158,7 @@ class XiaohongshuVideoUploadRequest:
     location: str | None = None
     album: str | None = None
     group_chat: str | None = None
+    draft: bool = False
 
 
 @dataclass(slots=True)
@@ -174,6 +175,7 @@ class XiaohongshuNoteUploadRequest:
     location: str | None = None
     album: str | None = None
     group_chat: str | None = None
+    draft: bool = False
 
 
 @dataclass(slots=True)
@@ -587,6 +589,7 @@ async def upload_xiaohongshu_video(request: XiaohongshuVideoUploadRequest) -> Pa
         location=request.location,
         album=request.album,
         group_chat=request.group_chat,
+        draft=request.draft,
     )
     await app.main()
     return account_file
@@ -614,6 +617,7 @@ async def upload_xiaohongshu_note(request: XiaohongshuNoteUploadRequest) -> Path
         location=request.location,
         album=request.album,
         group_chat=request.group_chat,
+        draft=request.draft,
     )
     await app.main()
     return account_file
@@ -1036,6 +1040,7 @@ def build_parser() -> argparse.ArgumentParser:
     xiaohongshu_upload_video_parser.add_argument("--location", default="", help="Publish location, e.g. 深圳市 (optional)")
     xiaohongshu_upload_video_parser.add_argument("--album", default="", help="Join/create album (合集) by name, e.g. 我的合集 (optional)")
     xiaohongshu_upload_video_parser.add_argument("--group-chat", dest="group_chat", default="", help="Select a group chat (群聊) by name, created in App first (optional)")
+    xiaohongshu_upload_video_parser.add_argument("--draft", action="store_true", help="Save as draft instead of publishing (验证表单交互，不触发真实发布，不占节流额度)")
     add_runtime_flags(xiaohongshu_upload_video_parser)
 
     xiaohongshu_upload_note_parser = xiaohongshu_actions.add_parser("upload-note", help="Upload one note to Xiaohongshu")
@@ -1048,6 +1053,7 @@ def build_parser() -> argparse.ArgumentParser:
     xiaohongshu_upload_note_parser.add_argument("--location", default="", help="Publish location, e.g. 深圳市 (optional)")
     xiaohongshu_upload_note_parser.add_argument("--album", default="", help="Join/create album (合集) by name (optional)")
     xiaohongshu_upload_note_parser.add_argument("--group-chat", dest="group_chat", default="", help="Select a group chat (群聊) by name, created in App first (optional)")
+    xiaohongshu_upload_note_parser.add_argument("--draft", action="store_true", help="Save as draft instead of publishing (验证表单交互，不触发真实发布，不占节流额度)")
     add_runtime_flags(xiaohongshu_upload_note_parser)
 
     bilibili_parser = platform_parsers.add_parser("bilibili", help="Bilibili operations")
@@ -1395,6 +1401,7 @@ async def dispatch(args: argparse.Namespace) -> int:
                 location=args.location or None,
                 album=args.album or None,
                 group_chat=args.group_chat or None,
+                draft=args.draft,
             )
             await upload_xiaohongshu_video(request)
             print(f"Xiaohongshu video upload submitted: {request.video_file}")
@@ -1418,6 +1425,7 @@ async def dispatch(args: argparse.Namespace) -> int:
                 location=args.location or None,
                 album=args.album or None,
                 group_chat=args.group_chat or None,
+                draft=args.draft,
             )
             await upload_xiaohongshu_note(request)
             print(f"Xiaohongshu note upload submitted: {len(request.image_files)} images")

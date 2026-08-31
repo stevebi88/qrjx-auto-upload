@@ -12,10 +12,18 @@ from patchright.async_api import Playwright
 from patchright.async_api import async_playwright
 
 from conf import DEBUG_MODE, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
+from conf import (
+    PUBLISH_DAILY_LIMIT,
+    PUBLISH_MIN_INTERVAL_MIN,
+    PUBLISH_WINDOW,
+    PUBLISH_WINDOW_HARD_BLOCK,
+)
 from uploader.base_video import BaseVideoUploader
 from utils.base_social_media import cdp_click
 from utils.base_social_media import set_init_script
+from utils.human_behavior import check_publish_allowed
 from utils.human_behavior import human_sleep
+from utils.human_behavior import record_publish
 from utils.login_qrcode import build_login_qrcode_path
 from utils.login_qrcode import decode_qrcode_from_path
 from utils.login_qrcode import print_terminal_qrcode
@@ -342,6 +350,31 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
         else:
             self.publish_date = 0
 
+    async def _throttle_check(self) -> None:
+        """真实发布节流检查（存草稿模式跳过）。借鉴蚁小二：频率受控防风控。"""
+        if self.draft:
+            return
+        account = Path(self.account_file).stem
+        allowed, reason = check_publish_allowed(
+            "xiaohongshu",
+            account,
+            daily_limit=PUBLISH_DAILY_LIMIT,
+            min_interval_min=PUBLISH_MIN_INTERVAL_MIN,
+            hard_window=PUBLISH_WINDOW if PUBLISH_WINDOW_HARD_BLOCK else None,
+        )
+        if not allowed:
+            raise RuntimeError(
+                f"发布节流拦截: {reason}（可用 --draft 存草稿验证表单，不触发真实发布）"
+            )
+        # 窗口外软提示（默认不硬拦，只提醒）
+        if PUBLISH_WINDOW and not PUBLISH_WINDOW_HARD_BLOCK:
+            start_h, end_h = PUBLISH_WINDOW
+            now_h = datetime.now().hour
+            if not (start_h <= now_h < end_h):
+                xiaohongshu_logger.warning(
+                    _msg("🕐", f"当前 {now_h} 点不在推荐发布窗口 {start_h}-{end_h} 点（软提示，继续）")
+                )
+
     async def set_schedule_time_xiaohongshu(self, page: Page, publish_date: datetime):
         xiaohongshu_logger.info(_msg("🕒", f"小人准备设置定时发布时间: {publish_date.strftime(self.date_format)}"))
         await page.locator('.custom-switch-card').filter(has_text="定时发布").locator('.d-switch').click()
@@ -659,6 +692,7 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
         location: str | None = None,
         album: str | None = None,
         group_chat: str | None = None,
+        draft: bool = False,
     ):
         super().__init__(
             publish_date=publish_date,
@@ -675,6 +709,7 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
         self.location = location
         self.album = album
         self.group_chat = group_chat
+        self.draft = draft
 
     async def validate_upload_args(self):
         await self.validate_base_args()
@@ -815,6 +850,11 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
         if self.group_chat:
             await self.set_group_chat(page, self.group_chat)
 
+        if self.draft:
+            # 存草稿模式：跳过定时设置，只验证表单交互，不触发真实发布
+            await self._save_draft(page)
+            return
+
         if self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
             await self.set_schedule_time_xiaohongshu(page, self.publish_date)
 
@@ -823,12 +863,15 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
                 if self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED:
                     await page.locator('button:has-text("定时发布")').click()
                 else:
+                    # 真实发布前随机延迟（2.5~8s），避免固定节奏特征
+                    await human_sleep(2.5, 8.0)
                     await page.locator('button:has-text("发布")').click()
                 await page.wait_for_url(
                     XHS_PUBLISH_SUCCESS_URL_PATTERN,
                     timeout=3000
                 )
                 xiaohongshu_logger.success(_msg("🥳", "视频发布成功，小人开心收工"))
+                record_publish("xiaohongshu", Path(self.account_file).stem, draft=False)
                 break
             except Exception:
                 xiaohongshu_logger.info(_msg("🏃", "小人正在冲刺发布视频"))
@@ -836,10 +879,24 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
                     await page.screenshot(full_page=True)
                 await human_sleep(0.4, 1.2)
 
+    async def _save_draft(self, page: Page) -> None:
+        """点击「存草稿」：验证表单交互但不发布。多选择器容错。"""
+        draft_btn = page.locator('button:has-text("存草稿")').first
+        if not await draft_btn.count():
+            draft_btn = page.get_by_text("存草稿").first
+        await draft_btn.scroll_into_view_if_needed(timeout=4000)
+        await draft_btn.click(force=True)
+        await human_sleep(2.0, 4.0)
+        if self.debug:
+            await page.screenshot(full_page=True)
+        xiaohongshu_logger.success(_msg("📝", "已点击「存草稿」，表单验证完成（未真实发布）"))
+        record_publish("xiaohongshu", Path(self.account_file).stem, draft=True)
+
     async def upload(self, playwright: Playwright) -> None:
         xiaohongshu_logger.info(_msg("🧍", "小人先检查 cookie、视频文件、封面和发布时间"))
         await self.validate_upload_args()
         xiaohongshu_logger.info(_msg("🥳", "上传前检查通过"))
+        await self._throttle_check()
         browser = await playwright.chromium.launch(headless=self.headless, channel="chromium")
         context = await browser.new_context(
             permissions=["geolocation"],
@@ -881,6 +938,7 @@ class XiaoHongShuNote(XiaoHongShuBaseUploader):
         location: str | None = None,
         album: str | None = None,
         group_chat: str | None = None,
+        draft: bool = False,
     ):
         super().__init__(
             publish_date=publish_date,
@@ -897,6 +955,7 @@ class XiaoHongShuNote(XiaoHongShuBaseUploader):
         self.location = location
         self.album = album
         self.group_chat = group_chat
+        self.draft = draft
 
     async def validate_upload_args(self):
         await self.validate_base_args()
@@ -955,6 +1014,11 @@ class XiaoHongShuNote(XiaoHongShuBaseUploader):
         if self.group_chat:
             await self.set_group_chat(page, self.group_chat)
 
+        if self.draft:
+            # 存草稿模式：跳过定时设置，只验证表单交互，不触发真实发布
+            await self._save_draft(page)
+            return
+
         if self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
             await self.set_schedule_time_xiaohongshu(page, self.publish_date)
 
@@ -963,12 +1027,15 @@ class XiaoHongShuNote(XiaoHongShuBaseUploader):
                 if self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED:
                     await page.locator('button:has-text("定时发布")').click()
                 else:
+                    # 真实发布前随机延迟（2.5~8s），避免固定节奏特征
+                    await human_sleep(2.5, 8.0)
                     await page.locator('button:has-text("发布")').click()
                 await page.wait_for_url(
                     XHS_PUBLISH_SUCCESS_URL_PATTERN,
                     timeout=3000
                 )
                 xiaohongshu_logger.success(_msg("🥳", "图文发布成功，小人开心收工"))
+                record_publish("xiaohongshu", Path(self.account_file).stem, draft=False)
                 break
             except Exception:
                 xiaohongshu_logger.info(_msg("🏃", "小人正在冲刺发布图文"))
@@ -980,6 +1047,7 @@ class XiaoHongShuNote(XiaoHongShuBaseUploader):
         xiaohongshu_logger.info(_msg("🧍", "小人先检查 cookie、图片和发布时间"))
         await self.validate_upload_args()
         xiaohongshu_logger.info(_msg("🥳", "图文上传前检查通过"))
+        await self._throttle_check()
         browser = await playwright.chromium.launch(headless=self.headless, channel="chromium")
         context = await browser.new_context(
             permissions=["geolocation"],
